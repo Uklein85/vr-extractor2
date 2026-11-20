@@ -2,151 +2,195 @@ import pdfplumber
 import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import os
 import re
 
-def clean_text(text):
-    """Очистка текста от переносов строк и лишних пробелов"""
-    if text is None:
+# ---------------------- Вспомогательные функции ----------------------
+
+def clean_text(value):
+    """Убирает переносы строк, множественные пробелы, None."""
+    if value is None:
         return ""
-    return re.sub(r'\s+', ' ', str(text)).strip()
+    text = str(value).replace("\n", " ").replace("\r", " ")
+    return re.sub(r"\s+", " ", text).strip()
 
-def is_valid_row(row_data):
-    """Проверка, является ли строка валидной записью (имеет номер и описание)"""
-    # Обычно номер строки - это первая колонка, но в PDF она может быть смещена
-    if len(row_data) < 2:
-        return False
-    
-    # Проверяем, есть ли в первой или второй колонке число (номер строки)
-    col0 = clean_text(row_data[0])
-    if not col0.isdigit():
-        return False
-    return True
 
-def process_pdf(pdf_path, excel_path):
-    extracted_data = []
-    
+def is_row_number(s):
+    """Проверяет, что строка — это номер строки (возможно с точкой)."""
+    if not s:
+        return False
+    return s.strip().rstrip(".").isdigit()
+
+
+def is_section_header(row):
+    """
+    Заголовок раздела: одна непустая ячейка, начинающаяся с числа и текста,
+    например «1 Устройство утепления балочной клетки».
+    """
+    non_empty = [c for c in row if c]
+    if len(non_empty) != 1:
+        return False
+    return bool(re.match(r"^\d+\s+[А-ЯЁA-Zа-яё]", non_empty[0]))
+
+
+def is_skip_row(row_text):
+    """Служебные строки (шапка, подвал, обозначение документа)."""
+    markers = [
+        "Наименование вида работ",
+        "Код ГЭСН",
+        "Изм.", "Кол.уч", "Лист", "№док", "Подпись", "Дата",
+        "Ведомость объемов",
+        "0349.032",
+        "ФОРМАТ",
+        "Разраб.", "Пров.", "Нач.отд.", "Н.контр.",
+        "Главный инженер",
+    ]
+    return any(m in row_text for m in markers)
+
+
+# ---------------------- Основная обработка ----------------------
+
+def process_pdf(pdf_path, excel_path, root):
+    extracted = []
+
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                tables = page.extract_tables()
+                tables = page.extract_tables() or []
                 for table in tables:
                     if not table:
                         continue
-                    
                     for row in table:
                         if not row:
                             continue
-                            
-                        # Пропускаем заголовки таблиц
-                        row_text = " ".join([clean_text(cell) for cell in row if cell])
-                        if "Наименование вида работ" in row_text or "Код ГЭСН" in row_text:
+
+                        cleaned = [clean_text(c) for c in row]
+                        row_text = " ".join(c for c in cleaned if c).strip()
+                        if not row_text:
                             continue
-                        
-                        # Очищаем ячейки
-                        cleaned_row = [clean_text(cell) for cell in row]
-                        
-                        # Обработка строк, где номер строки есть, а остальное может быть разбито
-                        if is_valid_row(cleaned_row):
-                            # Формат PDF: [№ строки, Наименование, Ед.изм, Код ГЭСН, Кол-во]
-                            # Иногда колонки могут съезжать, поэтому берем по индексам
-                            row_num = cleaned_row[0]
-                            description = cleaned_row[1] if len(cleaned_row) > 1 else ""
-                            unit = cleaned_row[2] if len(cleaned_row) > 2 else ""
-                            quantity = cleaned_row[4] if len(cleaned_row) > 4 else ""
-                            
-                            # Если кол-во пустое, проверяем 3-ю колонку
-                            if not quantity and len(cleaned_row) > 3:
-                                quantity = cleaned_row[3]
-                            
-                            extracted_data.append({
-                                '№строки по ВР': row_num,
-                                'Наименование вида работ': description,
-                                'Ед. изм.': unit,
-                                'Кол-во': quantity
+                        if is_skip_row(row_text):
+                            continue
+
+                        # --- Заголовок раздела ---
+                        if is_section_header(cleaned):
+                            m = re.match(r"^(\d+)\s+(.+)$", cleaned[0])
+                            if m:
+                                extracted.append({
+                                    "№строки по ВР": m.group(1),
+                                    "Наименование вида работ": m.group(2),
+                                    "Ед. изм.": "",
+                                    "Кол-во": "",
+                                })
+                            continue
+
+                        # --- Обычная строка с номером ---
+                        if is_row_number(cleaned[0]):
+                            num  = cleaned[0].rstrip(".")
+                            desc = cleaned[1] if len(cleaned) > 1 else ""
+                            unit = ""
+                            qty  = ""
+
+                            if len(cleaned) >= 5:
+                                unit = cleaned[2]
+                                qty  = cleaned[4]
+                            elif len(cleaned) == 4:
+                                unit = cleaned[2]
+                                qty  = cleaned[3]
+                            elif len(cleaned) == 3:
+                                qty  = cleaned[2]
+
+                            extracted.append({
+                                "№строки по ВР": num,
+                                "Наименование вида работ": desc,
+                                "Ед. изм.": unit,
+                                "Кол-во": qty,
                             })
-                        else:
-                            # Обработка текстовых примечаний, которые идут без номера, 
-                            # но относятся к предыдущей строке (или просто являются примечаниями)
-                            # В вашем примере они иногда имеют номера, иногда нет.
-                            # Если номера нет, пропускаем, чтобы не засорять таблицу.
-                            pass
-                            
+                            continue
+
+                        # --- Продолжение предыдущей строки ---
+                        if not cleaned[0] and extracted:
+                            continuation = " ".join(c for c in cleaned[1:] if c)
+                            if continuation:
+                                for i in range(len(extracted) - 1, -1, -1):
+                                    if extracted[i]["Наименование вида работ"]:
+                                        extracted[i]["Наименование вида работ"] += " " + continuation
+                                        break
+                            # Иногда в продолжении бывает кол-во (5-я колонка)
+                            if len(cleaned) >= 5 and cleaned[4] and not extracted[-1]["Кол-во"]:
+                                extracted[-1]["Кол-во"] = cleaned[4]
+                            continue
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось прочитать PDF: {e}")
+        messagebox.showerror("Ошибка чтения PDF", str(e), parent=root)
         return False
 
-    if not extracted_data:
-        messagebox.showwarning("Внимание", "Не удалось найти табличные данные в PDF.")
+    if not extracted:
+        messagebox.showwarning(
+            "Внимание",
+            "В PDF не найдено табличных данных. Проверьте, что файл не защищён и содержит текст (не скан).",
+            parent=root,
+        )
         return False
 
-    # Создаем DataFrame
-    df = pd.DataFrame(extracted_data)
-    
-    # Добавляем пустые колонки согласно требованиям (ВиКР не заполняем)
-    df['примечание'] = ""
-    df['Уровень структуры*'] = ""
-    df['Шифр РД'] = ""
-    df['Код ВиКР'] = ""
-    df['Наменование ВиКР'] = "" # Опечатка из примера сохранена
-    df['ед. изм. ВиКР'] = ""
-    df['Кол-во ВиКР'] = ""
-    df['Кприв/Плечо возки'] = ""
-    
-    # Переупорядочиваем колонки как в примере
-    columns_order = [
-        '№строки по ВР', 'Наименование вида работ', 'Ед. изм.', 'Кол-во', 
-        'примечание', 'Уровень структуры*', 'Шифр РД', 
-        'Код ВиКР', 'Наменование ВиКР', 'ед. изм. ВиКР', 'Кол-во ВиКР', 'Кприв/Плечо возки'
-    ]
-    df = df[columns_order]
+    # --- Сборка итоговой таблицы ---
+    df = pd.DataFrame(extracted)
+    for col in [
+        "примечание", "Уровень структуры*", "Шифр РД",
+        "Код ВиКР", "Наменование ВиКР", "ед. изм. ВиКР",
+        "Кол-во ВиКР", "Кприв/Плечо возки",
+    ]:
+        df[col] = ""
 
-    # Сохраняем в Excel
+    df = df[[
+        "№строки по ВР", "Наименование вида работ", "Ед. изм.", "Кол-во",
+        "примечание", "Уровень структуры*", "Шифр РД",
+        "Код ВиКР", "Наменование ВиКР", "ед. изм. ВиКР",
+        "Кол-во ВиКР", "Кприв/Плечо возки",
+    ]]
+
     try:
-        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Выборка')
-            
-            # Автоподбор ширины колонок
-            worksheet = writer.sheets['Выборка']
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 80) # Ограничиваем макс. ширину
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-                
-        messagebox.showinfo("Успех", f"Файл успешно сохранен:\n{excel_path}")
-        return True
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="ВР исходный")
+            ws = writer.sheets["ВР исходный"]
+            for column_cells in ws.columns:
+                letter = column_cells[0].column_letter
+                max_len = max(
+                    (len(str(c.value)) for c in column_cells if c.value), default=0
+                )
+                ws.column_dimensions[letter].width = min(max_len + 2, 80)
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось сохранить Excel: {e}")
+        messagebox.showerror("Ошибка записи Excel", str(e), parent=root)
         return False
 
-def select_files():
+    messagebox.showinfo("Готово", f"Файл сохранён:\n{excel_path}", parent=root)
+    return True
+
+
+# ---------------------- Точка входа ----------------------
+
+def main():
     root = tk.Tk()
-    root.withdraw() # Скрываем главное окно
-    
+    root.withdraw()
+
     pdf_path = filedialog.askopenfilename(
-        title="Выберите исходный PDF файл",
-        filetypes=[("PDF files", "*.pdf")]
+        title="Выберите PDF-файл ведомости объёмов работ",
+        filetypes=[("PDF files", "*.pdf")],
     )
     if not pdf_path:
+        root.destroy()
         return
 
     excel_path = filedialog.asksaveasfilename(
-        title="Сохранить Excel как",
+        title="Куда сохранить выборку",
         defaultextension=".xlsx",
         filetypes=[("Excel files", "*.xlsx")],
-        initialfile="Выборка_из_PDF.xlsx"
+        initialfile="Выборка_из_PDF.xlsx",
     )
     if not excel_path:
+        root.destroy()
         return
 
-    process_pdf(pdf_path, excel_path)
+    process_pdf(pdf_path, excel_path, root)
+    root.destroy()
+
 
 if __name__ == "__main__":
-    select_files()
+    main()
