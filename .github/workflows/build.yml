@@ -3,7 +3,7 @@ name: Build EXE
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: # Позволяет запускать сборку вручную
+  workflow_dispatch:
 
 jobs:
   build:
@@ -25,9 +25,8 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        # --onefile собирает все в один exe
-        # --noconsole скрывает черное окно консоли при запуске GUI
-        pyinstaller --onefile --noconsole --name="PDF_to_Excel_Converter" main.py
+        # Используем python -m PyInstaller, чтобы обойти проблемы с PATH
+        python -m PyInstaller --onefile --noconsole --name="PDF_to_Excel_Converter" main.py
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
